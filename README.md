@@ -1,1 +1,2 @@
 # Infinity-Mario
+index.htmlをクリック！
