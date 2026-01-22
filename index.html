@@ -1,0 +1,704 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>擬似スーパーマリオ（無限自動生成 / 効果音 / リアルタイムスコア）</title>
+  <style>
+    :root { color-scheme: dark; }
+    body{
+      margin:0; background:#0b0f1a; color:#e6e6e6;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      display:flex; align-items:center; justify-content:center; min-height:100vh;
+    }
+    .wrap{ display:flex; flex-direction:column; gap:10px; align-items:center; }
+    canvas{
+      background:#5c94fc;
+      image-rendering: pixelated;
+      border:2px solid #223;
+      box-shadow: 0 10px 30px rgba(0,0,0,.35);
+      width:min(92vw, 960px); height:auto;
+    }
+    .hud{
+      width:min(92vw, 960px);
+      display:flex; justify-content:space-between; gap:12px; align-items:center;
+      font-size:14px; opacity:.95;
+      flex-wrap:wrap;
+    }
+    kbd{
+      padding:.15em .45em; border:1px solid #445; border-bottom-width:2px; border-radius:6px;
+      background:#111827; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .hint{ opacity:.85; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    button{
+      background:#111827; border:1px solid #445; border-bottom-width:2px; color:#e6e6e6;
+      border-radius:8px; padding:6px 10px; cursor:pointer; font-size:13px;
+    }
+    button:active{ transform: translateY(1px); }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hud">
+    <div><strong>擬似スーパーマリオ</strong>（無限ステージ自動生成）</div>
+    <div class="hint">
+      移動：<kbd>←</kbd><kbd>→</kbd>　ジャンプ：<kbd>Z</kbd>/<kbd>↑</kbd>
+      リスタート：<kbd>R</kbd>（スコア維持） 全リセット：<kbd>Shift</kbd>+<kbd>R</kbd>
+      ミュート：<kbd>M</kbd>
+      <button id="audioBtn">🔊 音：ON</button>
+    </div>
+  </div>
+  <canvas id="game" width="256" height="240"></canvas>
+</div>
+
+<script>
+(() => {
+  // ============================================================
+  //  基本設定（NES解像度風）
+  // ============================================================
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  const W = canvas.width;
+  const H = canvas.height;
+  const TILE = 16;
+
+  const GRAVITY = 0.42;
+  const MAX_FALL = 8.5;
+  const RUN_SPEED = 1.65;
+  const AIR_ACCEL = 0.08;
+  const GROUND_ACCEL = 0.18;
+  const FRICTION = 0.80;
+  const JUMP_VEL = 6.3; // 少し上げて余裕を確保（越えられない土管対策の保険）
+
+  const GROUND_Y_TILES = 14;
+  const LEVEL_H = 15;
+  const CHUNK_W = 16;
+
+  // ============================================================
+  //  入力
+  // ============================================================
+  const keys = new Set();
+  window.addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    keys.add(k);
+    if (["arrowup","arrowdown","arrowleft","arrowright"," "].includes(k)) e.preventDefault();
+    if (!audio.unlocked) audio.unlock();
+  }, { passive:false });
+  window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
+
+  // ============================================================
+  //  簡易効果音（Web Audio API）
+  // ============================================================
+  const audio = {
+    ctx: null,
+    master: null,
+    enabled: true,
+    unlocked: false,
+    unlock(){
+      if (this.unlocked) return;
+      try{
+        this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = 0.15;
+        this.master.connect(this.ctx.destination);
+        this.unlocked = true;
+      } catch {
+        this.enabled = false;
+        this.unlocked = false;
+      }
+      uiSync();
+    },
+    setEnabled(on){
+      this.enabled = !!on;
+      uiSync();
+    },
+    beep({freq=440, type="square", dur=0.08, gain=0.25, slideTo=null} = {}){
+      if (!this.enabled || !this.unlocked || !this.ctx) return;
+      const t0 = this.ctx.currentTime;
+      const o = this.ctx.createOscillator();
+      const g = this.ctx.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(freq, t0);
+      if (slideTo != null){
+        o.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), t0 + dur);
+      }
+      g.gain.setValueAtTime(gain, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g);
+      g.connect(this.master);
+      o.start(t0);
+      o.stop(t0 + dur + 0.01);
+    },
+    sfx: {
+      jump(){ audio.beep({freq: 520, type:"square", dur:0.09, gain:0.22, slideTo: 760}); },
+      coin(){ audio.beep({freq: 1100, type:"square", dur:0.07, gain:0.24, slideTo: 1400}); },
+      stomp(){ audio.beep({freq: 180, type:"square", dur:0.09, gain:0.22, slideTo: 120}); },
+      bump(){ audio.beep({freq: 280, type:"square", dur:0.06, gain:0.18, slideTo: 240}); },
+      hurt(){ audio.beep({freq: 140, type:"sawtooth", dur:0.18, gain:0.25, slideTo: 70}); },
+    }
+  };
+
+  const audioBtn = document.getElementById("audioBtn");
+  function uiSync(){
+    audioBtn.textContent = (!audio.enabled) ? "🔇 音：OFF" : "🔊 音：ON";
+  }
+  audioBtn.addEventListener("click", () => {
+    if (!audio.unlocked) audio.unlock();
+    audio.setEnabled(!audio.enabled);
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.key.toLowerCase() === "m"){
+      if (!audio.unlocked) audio.unlock();
+      audio.setEnabled(!audio.enabled);
+    }
+  });
+  uiSync();
+
+  // ============================================================
+  //  タイルID
+  // ============================================================
+  const T = {
+    EMPTY: 0,
+    GROUND: 1,
+    BRICK: 2,
+    QUESTION: 3,
+    PIPE_TOP_L: 4,
+    PIPE_TOP_R: 5,
+    PIPE_BODY_L: 6,
+    PIPE_BODY_R: 7,
+  };
+  const solidTiles = new Set([
+    T.GROUND, T.BRICK, T.QUESTION,
+    T.PIPE_TOP_L, T.PIPE_TOP_R, T.PIPE_BODY_L, T.PIPE_BODY_R
+  ]);
+  const isSolid = (id) => solidTiles.has(id);
+
+  // ============================================================
+  //  乱数（シード付き）
+  // ============================================================
+  let seed = 0xC0FFEE;
+  function rand(){
+    seed ^= seed << 13; seed >>>= 0;
+    seed ^= seed >> 17; seed >>>= 0;
+    seed ^= seed << 5;  seed >>>= 0;
+    return (seed >>> 0) / 4294967296;
+  }
+  const randi = (a, b) => a + Math.floor(rand() * (b - a + 1));
+
+  // ============================================================
+  //  無限ステージ自動生成（チャンク）
+  //  ★修正点：
+  //   - 土管の高さは必ず「2タイル」に固定（確実に越えられる）
+  //   - 土管の前後に“助走スペース”を確保（直前が穴/障害物にならない）
+  // ============================================================
+  const chunks = new Map(); // chunkIndex -> { tiles: Map("tx,ty"->id), meta }
+
+  function key(tx, ty){ return tx + "," + ty; }
+  function getChunkIndex(tx){ return Math.floor(tx / CHUNK_W); }
+
+  function ensureChunk(chunkIndex){
+    if (chunks.has(chunkIndex)) return;
+    chunks.set(chunkIndex, generateChunk(chunkIndex));
+  }
+
+  function setTileInChunk(ch, tx, ty, id){
+    ch.tiles.set(key(tx,ty), id);
+  }
+
+  function getTile(tx, ty){
+    if (ty < 0 || ty >= LEVEL_H) return T.EMPTY;
+    const ci = getChunkIndex(tx);
+    ensureChunk(ci);
+    const ch = chunks.get(ci);
+    return ch.tiles.get(key(tx,ty)) ?? T.EMPTY;
+  }
+
+  function generateChunk(chunkIndex){
+    const ch = { tiles: new Map(), meta: { gaps: [] } };
+    const x0 = chunkIndex * CHUNK_W;
+    const x1 = x0 + CHUNK_W - 1;
+
+    // 地面
+    for (let tx = x0; tx <= x1; tx++){
+      setTileInChunk(ch, tx, GROUND_Y_TILES, T.GROUND);
+    }
+
+    // 穴（最大2タイル）。端を避け、前後に踏み場を残す
+    const makeGap = (rand() < 0.18) && (chunkIndex > 0);
+    if (makeGap){
+      const gapW = (rand() < 0.65) ? 1 : 2;
+      const gapStart = x0 + randi(4, 9); // 中央寄り
+      for (let i=0; i<gapW; i++){
+        setTileInChunk(ch, gapStart+i, GROUND_Y_TILES, T.EMPTY);
+      }
+      ch.meta.gaps.push({start: gapStart, w: gapW});
+    }
+
+    // 土管（高さは固定2タイル：必ず越えられる）
+    // さらに、土管の左右2タイルは“地面保証”して助走/着地を確保
+    const makePipe = (!makeGap) && (rand() < 0.22);
+    if (makePipe){
+      const px = x0 + randi(7, 11); // 2幅＆左右余白を確保しやすい範囲
+      const pipeH = 2; // ★固定（越えられない土管が出ないように）
+
+      // 念のため：土管の前後2タイル分は穴にしない（地面保証）
+      for (let dx = -2; dx <= 3; dx++){
+        setTileInChunk(ch, px+dx, GROUND_Y_TILES, T.GROUND);
+      }
+
+      // 口（GROUND_Y_TILES - pipeH がトップ段）
+      setTileInChunk(ch, px,     GROUND_Y_TILES - pipeH, T.PIPE_TOP_L);
+      setTileInChunk(ch, px + 1, GROUND_Y_TILES - pipeH, T.PIPE_TOP_R);
+      // 胴（1段）
+      setTileInChunk(ch, px,     GROUND_Y_TILES - 1, T.PIPE_BODY_L);
+      setTileInChunk(ch, px + 1, GROUND_Y_TILES - 1, T.PIPE_BODY_R);
+    }
+
+    // ブロック（通行を塞がない高さに限定）
+    if (rand() < 0.65){
+      const rowY = randi(8, 10);
+      const count = randi(2, 6);
+      const start = x0 + randi(3, 10);
+      for (let i=0; i<count; i++){
+        const tx = start + i;
+        if (tx >= x1-1) break;
+        setTileInChunk(ch, tx, rowY, (rand() < 0.28) ? T.QUESTION : T.BRICK);
+      }
+      if (rand() < 0.25){
+        const tx = x0 + randi(5, 13);
+        setTileInChunk(ch, tx, rowY-2, (rand()<0.4) ? T.QUESTION : T.BRICK);
+      }
+    }
+
+    return ch;
+  }
+
+  // 先読み生成＋古いチャンク掃除
+  function ensureWorldAround(camTx){
+    const camChunk = getChunkIndex(camTx);
+    for (let i=-1; i<=3; i++) ensureChunk(camChunk + i);
+    const minKeep = camChunk - 5;
+    for (const k of chunks.keys()){
+      if (k < minKeep) chunks.delete(k);
+    }
+  }
+
+  // ============================================================
+  //  パーティクル/敵
+  // ============================================================
+  const particles = [];
+  function spawnCoin(x, y){
+    particles.push({ x, y, vy:-2.3, life:42 });
+  }
+
+  const enemies = [];
+  function maybeSpawnEnemyAhead(){
+    if (enemies.length > 6) return;
+    if (rand() < 0.015){
+      const tx = Math.floor((p.x + W*1.3) / TILE);
+      const spawnX = tx * TILE;
+      const spawnY = (GROUND_Y_TILES*TILE) - 12;
+      enemies.push({ x: spawnX, y: spawnY, vx: (rand()<0.5?-0.5:-0.55), vy:0, w:14, h:12, alive:true });
+    }
+  }
+
+  // ============================================================
+  //  スコア（リアルタイム更新）
+  //   - eventScore: コイン/踏み等のイベント加点
+  //   - distScore: 走った距離に応じて「毎フレーム」加点（小数で蓄積）
+  // ============================================================
+  let eventScore = 0;
+  let distScore = 0;         // 小数OK（表示時にfloor）
+  let best = 0;
+  let maxXPassed = 0;        // ピクセル単位で最大到達X（距離スコア用）
+
+  // 距離スコアのレート（1pxあたりの点）
+  // 例：0.06なら約16pxで0.96点 → ほぼ1点（リアルタイムに見える）
+  const DIST_RATE = 0.06;
+
+  const startPlayer = () => ({
+    x: 2*TILE,
+    y: (GROUND_Y_TILES*TILE) - 14,
+    vx: 0,
+    vy: 0,
+    w: 12,
+    h: 14,
+    onGround: false,
+    canJump: true,
+  });
+  let p = startPlayer();
+  let camX = 0;
+
+  // ============================================================
+  //  ユーティリティ
+  // ============================================================
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  function aabb(ax, ay, aw, ah, bx, by, bw, bh){
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+  function tileAtPixel(px, py){
+    const tx = Math.floor(px / TILE);
+    const ty = Math.floor(py / TILE);
+    return getTile(tx, ty);
+  }
+
+  // ============================================================
+  //  衝突解決
+  // ============================================================
+  function resolveCollisions(entity){
+    // X
+    entity.x += entity.vx;
+    let left = Math.floor(entity.x / TILE);
+    let right = Math.floor((entity.x + entity.w - 1) / TILE);
+    let top = Math.floor(entity.y / TILE);
+    let bottom = Math.floor((entity.y + entity.h - 1) / TILE);
+
+    for (let ty = top; ty <= bottom; ty++){
+      for (let tx = left; tx <= right; tx++){
+        const id = getTile(tx, ty);
+        if (!isSolid(id)) continue;
+        const tileX = tx * TILE;
+        if (entity.vx > 0){
+          entity.x = tileX - entity.w;
+          entity.vx = 0;
+        } else if (entity.vx < 0){
+          entity.x = tileX + TILE;
+          entity.vx = 0;
+        }
+        left = Math.floor(entity.x / TILE);
+        right = Math.floor((entity.x + entity.w - 1) / TILE);
+      }
+    }
+
+    // Y
+    entity.y += entity.vy;
+    entity.onGround = false;
+
+    left = Math.floor(entity.x / TILE);
+    right = Math.floor((entity.x + entity.w - 1) / TILE);
+    top = Math.floor(entity.y / TILE);
+    bottom = Math.floor((entity.y + entity.h - 1) / TILE);
+
+    for (let ty = top; ty <= bottom; ty++){
+      for (let tx = left; tx <= right; tx++){
+        const id = getTile(tx, ty);
+        if (!isSolid(id)) continue;
+
+        const tileX = tx * TILE;
+        const tileY = ty * TILE;
+
+        if (entity.vy > 0){
+          entity.y = tileY - entity.h;
+          entity.vy = 0;
+          entity.onGround = true;
+          entity.canJump = true;
+        } else if (entity.vy < 0){
+          entity.y = tileY + TILE;
+          entity.vy = 0;
+
+          if (id === T.QUESTION){
+            const ci = getChunkIndex(tx);
+            ensureChunk(ci);
+            const ch = chunks.get(ci);
+            ch.tiles.set(key(tx,ty), T.BRICK);
+
+            spawnCoin(tileX + TILE/2, tileY - 2);
+            eventScore += 100;
+            audio.sfx.coin();
+          } else {
+            audio.sfx.bump();
+          }
+        }
+        top = Math.floor(entity.y / TILE);
+        bottom = Math.floor((entity.y + entity.h - 1) / TILE);
+      }
+    }
+  }
+
+  // ============================================================
+  //  更新
+  // ============================================================
+  function updatePlayer(){
+    const left = keys.has("arrowleft");
+    const right = keys.has("arrowright");
+    const jump = keys.has("z") || keys.has("arrowup");
+
+    if (left && !right){
+      p.vx -= p.onGround ? GROUND_ACCEL : AIR_ACCEL;
+    } else if (right && !left){
+      p.vx += p.onGround ? GROUND_ACCEL : AIR_ACCEL;
+    } else if (p.onGround){
+      p.vx *= FRICTION;
+      if (Math.abs(p.vx) < 0.05) p.vx = 0;
+    }
+    p.vx = clamp(p.vx, -RUN_SPEED, RUN_SPEED);
+
+    if (jump && p.canJump){
+      p.vy = -JUMP_VEL;
+      p.onGround = false;
+      p.canJump = false;
+      audio.sfx.jump();
+    }
+    if (!jump && p.onGround){
+      p.canJump = true;
+    }
+
+    p.vy += GRAVITY;
+    p.vy = Math.min(p.vy, MAX_FALL);
+
+    resolveCollisions(p);
+
+    // 落下死
+    if (p.y > H + 40){
+      audio.sfx.hurt();
+      restart(false);
+      return;
+    }
+
+    // カメラ
+    camX = Math.max(0, p.x - W*0.45);
+
+    // 生成先読み
+    ensureWorldAround(Math.floor((camX + W) / TILE));
+
+    // 距離スコア（毎フレーム更新：リアルタイム感）
+    if (p.x > maxXPassed){
+      const dx = p.x - maxXPassed;
+      distScore += dx * DIST_RATE;
+      maxXPassed = p.x;
+    }
+
+    maybeSpawnEnemyAhead();
+  }
+
+  function updateEnemies(){
+    for (const e of enemies){
+      if (!e.alive) continue;
+
+      e.vy += GRAVITY;
+      e.vy = Math.min(e.vy, MAX_FALL);
+
+      e.x += e.vx;
+
+      const frontX = e.vx > 0 ? (e.x + e.w + 1) : (e.x - 1);
+      const footY = e.y + e.h - 1;
+      if (isSolid(tileAtPixel(frontX, footY))) e.vx *= -1;
+
+      const aheadX = e.vx > 0 ? (e.x + e.w + 2) : (e.x - 2);
+      const aheadY = e.y + e.h + 1;
+      if (!isSolid(tileAtPixel(aheadX, aheadY))) e.vx *= -1;
+
+      e.y += e.vy;
+      const below1 = tileAtPixel(e.x + 2, e.y + e.h);
+      const below2 = tileAtPixel(e.x + e.w - 2, e.y + e.h);
+      if (isSolid(below1) || isSolid(below2)){
+        e.y = Math.floor((e.y + e.h) / TILE) * TILE - e.h;
+        e.vy = 0;
+      }
+
+      if (aabb(p.x, p.y, p.w, p.h, e.x, e.y, e.w, e.h)){
+        const pPrevBottom = p.y + p.h - p.vy;
+        const eTop = e.y;
+        if (p.vy > 0 && pPrevBottom <= eTop + 2){
+          e.alive = false;
+          p.vy = -JUMP_VEL * 0.65;
+          eventScore += 200;
+          audio.sfx.stomp();
+        } else {
+          audio.sfx.hurt();
+          restart(false);
+          return;
+        }
+      }
+    }
+
+    const minX = camX - 80;
+    for (let i=enemies.length-1; i>=0; i--){
+      if ((!enemies[i].alive && enemies[i].x < minX) || (enemies[i].x < minX - 200)){
+        enemies.splice(i,1);
+      }
+    }
+  }
+
+  function updateParticles(){
+    for (let i=particles.length-1; i>=0; i--){
+      const pt = particles[i];
+      pt.y += pt.vy;
+      pt.vy += 0.12;
+      pt.life--;
+      if (pt.life <= 0) particles.splice(i, 1);
+    }
+  }
+
+  function totalScore(){
+    return eventScore + Math.floor(distScore);
+  }
+
+  // restart(hard): hard=trueで完全リセット
+  function restart(hard){
+    if (hard){
+      eventScore = 0;
+      distScore = 0;
+      best = 0;
+      maxXPassed = 0;
+      enemies.length = 0;
+      chunks.clear();
+      seed = 0xC0FFEE;
+    } else {
+      best = Math.max(best, totalScore());
+      enemies.length = 0;
+      // スコアは維持（要望通り）
+    }
+    p = startPlayer();
+    camX = 0;
+    ensureWorldAround(0);
+  }
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key.toLowerCase() === "r"){
+      restart(e.shiftKey);
+    }
+  });
+
+  // 初期生成
+  ensureWorldAround(0);
+
+  // ============================================================
+  //  描画
+  // ============================================================
+  function draw(){
+    ctx.clearRect(0, 0, W, H);
+
+    // 背景（雲）
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = "#ffffff";
+    for (let i=0; i<12; i++){
+      const x = ((i*90) - (camX*0.35)) % 900 - 60;
+      const y = 25 + (i%3)*18;
+      ctx.fillRect(x, y, 18, 6);
+      ctx.fillRect(x+8, y-4, 14, 6);
+      ctx.fillRect(x+12, y+4, 16, 6);
+    }
+    ctx.globalAlpha = 1;
+
+    // タイル
+    const startTx = Math.floor(camX / TILE) - 1;
+    const endTx = Math.ceil((camX + W) / TILE) + 1;
+
+    for (let ty=0; ty<LEVEL_H; ty++){
+      for (let tx=startTx; tx<=endTx; tx++){
+        const id = getTile(tx, ty);
+        if (id === T.EMPTY) continue;
+
+        const x = tx*TILE - camX;
+        const y = ty*TILE;
+
+        if (id === T.GROUND){
+          ctx.fillStyle = "#c84c0c";
+          ctx.fillRect(x, y, TILE, TILE);
+          ctx.fillStyle = "#f7b733";
+          ctx.fillRect(x, y, TILE, 3);
+        } else if (id === T.BRICK){
+          ctx.fillStyle = "#b04a19";
+          ctx.fillRect(x, y, TILE, TILE);
+          ctx.fillStyle = "rgba(0,0,0,0.25)";
+          ctx.fillRect(x+2, y+2, TILE-4, 2);
+          ctx.fillRect(x+2, y+8, TILE-4, 2);
+        } else if (id === T.QUESTION){
+          ctx.fillStyle = "#e8b100";
+          ctx.fillRect(x, y, TILE, TILE);
+          ctx.fillStyle = "rgba(0,0,0,0.35)";
+          ctx.fillRect(x+2, y+2, TILE-4, 2);
+          ctx.fillStyle = "#ffffff";
+          ctx.font = "bold 12px ui-monospace, monospace";
+          ctx.fillText("?", x+5, y+12);
+        } else {
+          // パイプ系
+          ctx.fillStyle = "#1a9e3a";
+          ctx.fillRect(x, y, TILE, TILE);
+          ctx.fillStyle = "rgba(255,255,255,0.22)";
+          ctx.fillRect(x+2, y+2, 3, TILE-4);
+          ctx.fillStyle = "rgba(0,0,0,0.18)";
+          ctx.fillRect(x+TILE-3, y+2, 2, TILE-4);
+
+          if (id === T.PIPE_TOP_L || id === T.PIPE_TOP_R){
+            ctx.fillStyle = "#0f6f28";
+            ctx.fillRect(x, y, TILE, 3);
+            ctx.fillRect(x, y+3, TILE, 2);
+          }
+        }
+      }
+    }
+
+    // 敵
+    for (const e of enemies){
+      if (!e.alive) continue;
+      const x = e.x - camX;
+      const y = e.y;
+      ctx.fillStyle = "#7a4a20";
+      ctx.fillRect(x, y, e.w, e.h);
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(x+3, y+4, 2, 2);
+      ctx.fillRect(x+9, y+4, 2, 2);
+    }
+
+    // コイン演出
+    for (const pt of particles){
+      const x = pt.x - camX;
+      const y = pt.y;
+      ctx.fillStyle = "#ffd34d";
+      ctx.beginPath();
+      ctx.ellipse(x, y, 4, 6, 0, 0, Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(0,0,0,0.25)";
+      ctx.stroke();
+    }
+
+    // プレイヤー
+    {
+      const x = p.x - camX;
+      const y = p.y;
+      ctx.fillStyle = "#ff2d2d";
+      ctx.fillRect(x, y+5, p.w, p.h-5);
+      ctx.fillStyle = "#f1c27d";
+      ctx.fillRect(x+2, y, p.w-4, 7);
+      ctx.fillStyle = "#1d4ed8";
+      ctx.fillRect(x, y+10, p.w, 4);
+      ctx.fillStyle = "#000";
+      ctx.fillRect(x+7, y+2, 1, 1);
+    }
+
+    // HUD（リアルタイムに増える：distScoreは毎フレーム増加）
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.fillRect(6, 6, 200, 26);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, monospace";
+    ctx.fillText(`SCORE ${String(totalScore()).padStart(7,"0")}`, 10, 18);
+    ctx.fillText(`BEST  ${String(best).padStart(7,"0")}`, 10, 30);
+
+    // 音が未解放の場合の注意
+    if (!audio.unlocked){
+      ctx.fillStyle = "rgba(0,0,0,0.45)";
+      ctx.fillRect(W/2-108, 48, 216, 32);
+      ctx.fillStyle = "#fff";
+      ctx.fillText("音を有効化：何かキー/ボタン", W/2-96, 68);
+    }
+  }
+
+  // ============================================================
+  //  ループ
+  // ============================================================
+  function tick(){
+    updatePlayer();
+    updateEnemies();
+    updateParticles();
+    draw();
+    requestAnimationFrame(tick);
+  }
+  tick();
+})();
+</script>
+</body>
+</html>
+
